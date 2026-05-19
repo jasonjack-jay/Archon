@@ -34,6 +34,7 @@ interface JsonlEvent {
   workflow_name?: string;
   step?: string;
   node_type?: string;
+  gate_class?: string;
   duration_ms?: number;
   cost_usd?: number;
   tokens?: {
@@ -93,6 +94,7 @@ describe('cost commands', () => {
       total_tokens_out: 0,
       total_tokens_cached: 0,
       node_count: 0,
+      gates: [],
       top_nodes_by_wall: [],
     });
   });
@@ -129,6 +131,7 @@ describe('cost commands', () => {
       total_tokens_out: 25,
       total_tokens_cached: 12,
       node_count: 1,
+      gates: [],
       top_nodes_by_wall: [
         {
           node_id: 'draft',
@@ -189,11 +192,128 @@ describe('cost commands', () => {
       total_tokens_out: 30,
       total_tokens_cached: 0,
       node_count: 3,
+      gates: [],
       top_nodes_by_wall: [
         { node_id: 'lint', node_type: 'bash', wall_ms: 900, cost_usd: 0 },
         { node_id: 'plan', node_type: 'command', wall_ms: 700, cost_usd: 0.15 },
         { node_id: 'report', node_type: 'script', wall_ms: 300, cost_usd: 0.05 },
       ],
+    });
+  });
+
+  it('summary includes gates array for successful gate completions', async () => {
+    await writeRun('gate-success-run', [
+      {
+        type: 'workflow_start',
+        ts: '2026-05-19T12:00:00.000Z',
+        workflow_name: 'gate-workflow',
+      },
+      {
+        type: 'node_complete',
+        ts: '2026-05-19T12:00:01.000Z',
+        step: 'gate-a',
+        node_type: 'gate',
+        gate_class: 'assert-closes-keyword',
+        duration_ms: 180,
+      },
+      {
+        type: 'node_complete',
+        ts: '2026-05-19T12:00:02.000Z',
+        step: 'prompt-a',
+        node_type: 'prompt',
+        duration_ms: 20,
+        cost_usd: 0.1,
+        tokens: { input: 5, output: 2, total: 7, cost: 0.1 },
+      },
+    ]);
+
+    const exitCode = await costSummaryCommand('gate-success-run', {
+      cwd: testDir,
+      json: true,
+      logDir: testDir,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(parseJsonLogCall<Record<string, unknown>>()).toEqual({
+      total_wall_ms: 200,
+      total_cost_usd: 0.1,
+      total_tokens_in: 5,
+      total_tokens_out: 2,
+      total_tokens_cached: 0,
+      node_count: 2,
+      gates: [
+        {
+          class: 'assert-closes-keyword',
+          count: 1,
+          failures: 0,
+          total_wall_ms: 180,
+        },
+      ],
+      top_nodes_by_wall: [
+        { node_id: 'gate-a', node_type: 'gate', wall_ms: 180, cost_usd: 0 },
+        { node_id: 'prompt-a', node_type: 'prompt', wall_ms: 20, cost_usd: 0.1 },
+      ],
+    });
+  });
+
+  it('summary counts gate failures from node_error lines separately', async () => {
+    await writeRun('gate-failure-run', [
+      {
+        type: 'workflow_start',
+        ts: '2026-05-19T13:00:00.000Z',
+        workflow_name: 'gate-workflow',
+      },
+      {
+        type: 'node_complete',
+        ts: '2026-05-19T13:00:01.000Z',
+        step: 'gate-pass',
+        node_type: 'gate',
+        gate_class: 'assert-closes-keyword',
+        duration_ms: 90,
+      },
+      {
+        type: 'node_error',
+        ts: '2026-05-19T13:00:02.000Z',
+        step: 'gate-fail',
+        gate_class: 'assert-closes-keyword',
+      },
+      {
+        type: 'node_error',
+        ts: '2026-05-19T13:00:03.000Z',
+        step: 'other-fail',
+        gate_class: 'assert-no-tabs',
+      },
+    ]);
+
+    const exitCode = await costSummaryCommand('gate-failure-run', {
+      cwd: testDir,
+      json: true,
+      logDir: testDir,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(parseJsonLogCall<Record<string, unknown>>()).toEqual({
+      total_wall_ms: 90,
+      total_cost_usd: 0,
+      total_tokens_in: 0,
+      total_tokens_out: 0,
+      total_tokens_cached: 0,
+      node_count: 1,
+      gates: [
+        {
+          class: 'assert-closes-keyword',
+          count: 1,
+          failures: 1,
+          total_wall_ms: 90,
+        },
+        {
+          class: 'assert-no-tabs',
+          count: 0,
+          failures: 1,
+          total_wall_ms: 0,
+        },
+      ],
+      top_nodes_by_wall: [{ node_id: 'gate-pass', node_type: 'gate', wall_ms: 90, cost_usd: 0 }],
     });
   });
 
@@ -279,6 +399,7 @@ describe('cost commands', () => {
         p95_wall_ms: 400,
         total_tokens_in: 7,
         total_tokens_out: 4,
+        gates_by_class: {},
       },
       {
         workflow_name: 'ship',
@@ -288,6 +409,83 @@ describe('cost commands', () => {
         p95_wall_ms: 900,
         total_tokens_in: 60,
         total_tokens_out: 6,
+        gates_by_class: {},
+      },
+    ]);
+  });
+
+  it('roll aggregates gates_by_class once per run with failure counts', async () => {
+    await writeRun('gate-roll-a', [
+      {
+        type: 'workflow_start',
+        ts: '2026-05-18T13:00:00.000Z',
+        workflow_name: 'gate-roll',
+      },
+      {
+        type: 'node_complete',
+        ts: '2026-05-18T13:00:01.000Z',
+        step: 'gate-a-1',
+        node_type: 'gate',
+        gate_class: 'assert-closes-keyword',
+        duration_ms: 100,
+      },
+      {
+        type: 'node_complete',
+        ts: '2026-05-18T13:00:02.000Z',
+        step: 'gate-a-2',
+        node_type: 'gate',
+        gate_class: 'assert-closes-keyword',
+        duration_ms: 50,
+      },
+      {
+        type: 'node_error',
+        ts: '2026-05-18T13:00:03.000Z',
+        step: 'gate-a-3',
+        gate_class: 'assert-closes-keyword',
+      },
+      {
+        type: 'node_error',
+        ts: '2026-05-18T13:00:04.000Z',
+        step: 'gate-a-4',
+        gate_class: 'assert-no-tabs',
+      },
+    ]);
+    await writeRun('gate-roll-b', [
+      {
+        type: 'workflow_start',
+        ts: '2026-05-18T14:00:00.000Z',
+        workflow_name: 'gate-roll',
+      },
+      {
+        type: 'node_complete',
+        ts: '2026-05-18T14:00:01.000Z',
+        step: 'gate-b-1',
+        node_type: 'gate',
+        gate_class: 'assert-closes-keyword',
+        duration_ms: 75,
+      },
+    ]);
+
+    const exitCode = await costRollCommand({
+      cwd: testDir,
+      json: true,
+      logDir: testDir,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(parseJsonLogCall<Array<Record<string, unknown>>>()).toEqual([
+      {
+        workflow_name: 'gate-roll',
+        runs: 2,
+        avg_cost_usd: 0,
+        p50_wall_ms: 75,
+        p95_wall_ms: 150,
+        total_tokens_in: 0,
+        total_tokens_out: 0,
+        gates_by_class: {
+          'assert-closes-keyword': { runs_fired: 2, runs_failed: 1 },
+          'assert-no-tabs': { runs_fired: 1, runs_failed: 1 },
+        },
       },
     ]);
   });

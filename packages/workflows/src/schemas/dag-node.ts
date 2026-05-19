@@ -11,6 +11,7 @@
  * so a flat schema with superRefine is cleaner than a z.union() with implicit discriminants.
  */
 import { z } from '@hono/zod-openapi';
+import { basename, extname } from 'path';
 import { stepRetryConfigSchema } from './retry';
 import { loopNodeConfigSchema } from './loop';
 import { workflowNodeHooksSchema } from './hooks';
@@ -180,6 +181,7 @@ export const commandNodeSchema = dagNodeBaseSchema.extend({
 export type CommandNode = z.infer<typeof commandNodeSchema> & {
   prompt?: never;
   bash?: never;
+  gate?: never;
   loop?: never;
   approval?: never;
   cancel?: never;
@@ -194,6 +196,7 @@ export const promptNodeSchema = dagNodeBaseSchema.extend({
 export type PromptNode = z.infer<typeof promptNodeSchema> & {
   command?: never;
   bash?: never;
+  gate?: never;
   loop?: never;
   approval?: never;
   cancel?: never;
@@ -213,6 +216,29 @@ export const bashNodeSchema = dagNodeBaseSchema.extend({
 export type BashNode = z.infer<typeof bashNodeSchema> & {
   command?: never;
   prompt?: never;
+  gate?: never;
+  loop?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
+/**
+ * Gate node schema — extends base with `gate` (shell script), optional
+ * `gate_class`, and `timeout` (ms). Same runtime execution mechanics as bash,
+ * but failures are structured for operator-facing telemetry and diagnostics.
+ */
+export const gateNodeSchema = dagNodeBaseSchema.extend({
+  gate: z.string(),
+  gate_class: z.string().optional(),
+  timeout: z.number().optional(),
+});
+
+/** DAG node that runs a shell-based gate with structured failure semantics */
+export type GateNode = z.infer<typeof gateNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
   loop?: never;
   approval?: never;
   cancel?: never;
@@ -236,6 +262,7 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
   command?: never;
   prompt?: never;
   bash?: never;
+  gate?: never;
   loop?: never;
   approval?: never;
   cancel?: never;
@@ -255,6 +282,7 @@ export type LoopNode = z.infer<typeof loopNodeSchema> & {
   command?: never;
   prompt?: never;
   bash?: never;
+  gate?: never;
   approval?: never;
   cancel?: never;
   script?: never;
@@ -285,6 +313,7 @@ export type ApprovalNode = z.infer<typeof approvalNodeSchema> & {
   command?: never;
   prompt?: never;
   bash?: never;
+  gate?: never;
   loop?: never;
   cancel?: never;
   script?: never;
@@ -303,16 +332,18 @@ export type CancelNode = z.infer<typeof cancelNodeSchema> & {
   command?: never;
   prompt?: never;
   bash?: never;
+  gate?: never;
   loop?: never;
   approval?: never;
   script?: never;
 };
 
-/** A single node in a DAG workflow. command, prompt, bash, loop, approval, cancel, and script are mutually exclusive. */
+/** A single node in a DAG workflow. command, prompt, bash, gate, loop, approval, cancel, and script are mutually exclusive. */
 export type DagNode =
   | CommandNode
   | PromptNode
   | BashNode
+  | GateNode
   | LoopNode
   | ApprovalNode
   | CancelNode
@@ -343,6 +374,9 @@ export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'sandbox',
 ];
 
+/** AI-specific fields that are meaningless on gate nodes — same as bash nodes */
+export const GATE_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
+
 /** AI-specific fields that are meaningless on script nodes — same as bash nodes */
 export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
 
@@ -355,6 +389,20 @@ export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter
   f => f !== 'model' && f !== 'provider'
 );
 
+export function deriveGateClass(gate: string): string | null {
+  const firstToken = gate.trim().split(/\s+/)[0];
+  if (!firstToken) return null;
+
+  const baseToken = basename(firstToken);
+  if (!baseToken) return null;
+
+  const extension = extname(baseToken);
+  const withoutExtension =
+    extension.length > 0 ? baseToken.slice(0, baseToken.length - extension.length) : baseToken;
+
+  return withoutExtension.length > 0 ? withoutExtension : null;
+}
+
 // ---------------------------------------------------------------------------
 // dagNodeSchema — flat validation schema with transform to DagNode
 // ---------------------------------------------------------------------------
@@ -364,11 +412,11 @@ export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter
  *
  * Enforces:
  * - Non-empty id
- * - Exactly one of command/prompt/bash/loop (mutual exclusivity)
+ * - Exactly one of command/prompt/bash/gate/loop (mutual exclusivity)
  * - command name validity (via isValidCommandName)
  * - idle_timeout must be a finite positive number
  * - retry not allowed on loop nodes
- * - timeout on bash must be positive
+ * - timeout on bash/gate/script must be positive
  *
  * Note: provider identity is validated in loader.ts (workflow-level) and
  * dag-executor.ts (node-level). Model strings are passed through to the SDK
@@ -380,6 +428,8 @@ export const dagNodeSchema = dagNodeBaseSchema
     command: z.string().optional(),
     prompt: z.string().optional(),
     bash: z.string().optional(),
+    gate: z.string().optional(),
+    gate_class: z.string().optional(),
     loop: loopNodeConfigSchema.optional(),
     approval: z
       .object({
@@ -412,6 +462,7 @@ export const dagNodeSchema = dagNodeBaseSchema
     const hasCommand = typeof data.command === 'string' && data.command.trim().length > 0;
     const hasPrompt = typeof data.prompt === 'string' && data.prompt.trim().length > 0;
     const hasBash = typeof data.bash === 'string' && data.bash.trim().length > 0;
+    const hasGate = typeof data.gate === 'string' && data.gate.trim().length > 0;
     const hasLoop = data.loop !== undefined;
     const hasApproval = data.approval !== undefined;
     const hasCancel = typeof data.cancel === 'string' && data.cancel.trim().length > 0;
@@ -421,6 +472,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       hasCommand,
       hasPrompt,
       hasBash,
+      hasGate,
       hasLoop,
       hasApproval,
       hasCancel,
@@ -431,7 +483,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', and 'script' are mutually exclusive",
+          "'command', 'prompt', 'bash', 'gate', 'loop', 'approval', 'cancel', and 'script' are mutually exclusive",
       });
       return z.NEVER;
     }
@@ -452,6 +504,14 @@ export const dagNodeSchema = dagNodeBaseSchema
         });
         return z.NEVER;
       }
+      if (typeof data.gate === 'string') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'gate script cannot be empty',
+          path: ['gate'],
+        });
+        return z.NEVER;
+      }
       if (typeof data.script === 'string') {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -463,7 +523,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "must have either 'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', or 'script'",
+          "must have either 'command', 'prompt', 'bash', 'gate', 'loop', 'approval', 'cancel', or 'script'",
       });
       return z.NEVER;
     }
@@ -484,6 +544,25 @@ export const dagNodeSchema = dagNodeBaseSchema
           code: z.ZodIssueCode.custom,
           message: "'timeout' must be a positive number (ms)",
           path: ['timeout'],
+        });
+      }
+    }
+
+    // Gate node validations
+    if (hasGate) {
+      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'timeout' must be a positive number (ms)",
+          path: ['timeout'],
+        });
+      }
+
+      if (data.gate_class === undefined && deriveGateClass(data.gate ?? '') === null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'gate_class' could not be derived from 'gate'; specify 'gate_class' explicitly",
+          path: ['gate'],
         });
       }
     }
@@ -581,6 +660,17 @@ export const dagNodeSchema = dagNodeBaseSchema
         ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
       } as BashNode;
     }
+    if (data.gate !== undefined && data.gate.trim().length > 0) {
+      const gateClass = data.gate_class ?? deriveGateClass(data.gate);
+      if (!gateClass) throw new Error('unreachable: gate_class must be defined for gate nodes');
+      return {
+        ...base,
+        ...shared,
+        gate: data.gate.trim(),
+        gate_class: gateClass,
+        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+      } as GateNode;
+    }
     if (data.script !== undefined && data.script.trim().length > 0) {
       // runtime is guaranteed by superRefine to be defined at this point
       if (!data.runtime) throw new Error('unreachable: runtime must be defined for script nodes');
@@ -617,6 +707,11 @@ export function isBashNode(node: DagNode): node is BashNode {
 /** Type guard: check if a DAG node is a loop (iterative) node */
 export function isLoopNode(node: DagNode): node is LoopNode {
   return 'loop' in node && typeof node.loop === 'object' && node.loop !== null;
+}
+
+/** Type guard: check if a DAG node is a gate node */
+export function isGateNode(node: DagNode): node is GateNode {
+  return 'gate' in node && typeof node.gate === 'string';
 }
 
 /** Type guard: check if a DAG node is an approval (human-in-the-loop) node */

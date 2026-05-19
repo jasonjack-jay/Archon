@@ -2,13 +2,16 @@ import { describe, test, expect } from 'bun:test';
 import {
   isBashNode,
   isCancelNode,
+  isGateNode,
   isScriptNode,
   isTriggerRule,
   TRIGGER_RULES,
+  GATE_NODE_AI_FIELDS,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
+  gateNodeSchema,
 } from './schemas';
 import type {
   WorkflowDefinition,
@@ -17,6 +20,7 @@ import type {
   PromptNode,
   BashNode,
   CancelNode,
+  GateNode,
   ScriptNode,
   TriggerRule,
 } from './schemas';
@@ -28,6 +32,7 @@ import type {
 const commandNode: CommandNode = { id: 'n1', command: 'build' };
 const promptNode: PromptNode = { id: 'n2', prompt: 'Do this inline.' };
 const bashNode: BashNode = { id: 'n3', bash: 'echo hello' };
+const gateNode: GateNode = { id: 'n4', gate: './scripts/check.sh', gate_class: 'check' };
 const cancelNode: CancelNode = { id: 'n5', cancel: 'Precondition failed' };
 
 const dagWorkflow: WorkflowDefinition = {
@@ -72,6 +77,48 @@ describe('isBashNode', () => {
     // Deliberately violate the type to ensure the runtime check catches it
     const malformed = { id: 'x', bash: 42 } as unknown as DagNode;
     expect(isBashNode(malformed)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isGateNode
+// ---------------------------------------------------------------------------
+
+describe('isGateNode', () => {
+  const scriptNode: ScriptNode = { id: 's1', script: 'console.log("hi")', runtime: 'bun' };
+
+  test('returns true for a GateNode', () => {
+    expect(isGateNode(gateNode)).toBe(true);
+  });
+
+  test('returns true for a GateNode without explicit gate_class', () => {
+    const derivedClassNode = { id: 'g1', gate: './scripts/check.sh' } as GateNode;
+    expect(isGateNode(derivedClassNode)).toBe(true);
+  });
+
+  test('returns false for a CommandNode', () => {
+    expect(isGateNode(commandNode)).toBe(false);
+  });
+
+  test('returns false for a PromptNode', () => {
+    expect(isGateNode(promptNode)).toBe(false);
+  });
+
+  test('returns false for a BashNode', () => {
+    expect(isGateNode(bashNode)).toBe(false);
+  });
+
+  test('returns false for a ScriptNode', () => {
+    expect(isGateNode(scriptNode)).toBe(false);
+  });
+
+  test('returns false for a CancelNode', () => {
+    expect(isGateNode(cancelNode)).toBe(false);
+  });
+
+  test('returns false when gate is not a string (malformed node)', () => {
+    const malformed = { id: 'x', gate: 42 } as unknown as DagNode;
+    expect(isGateNode(malformed)).toBe(false);
   });
 });
 
@@ -274,6 +321,207 @@ describe('dagNodeSchema — empty bash/prompt', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error.issues[0].message).toContain('must have either');
+    }
+  });
+
+  test('emits "gate script cannot be empty" for gate: ""', () => {
+    const result = dagNodeSchema.safeParse({ id: 'n1', gate: '' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toBe('gate script cannot be empty');
+      expect(result.error.issues[0].path).toEqual(['gate']);
+    }
+  });
+
+  test('emits "gate script cannot be empty" for whitespace-only gate', () => {
+    const result = dagNodeSchema.safeParse({ id: 'n1', gate: '   ' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toBe('gate script cannot be empty');
+      expect(result.error.issues[0].path).toEqual(['gate']);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dagNodeSchema — GateNode parsing and validation
+// ---------------------------------------------------------------------------
+
+describe('dagNodeSchema — GateNode', () => {
+  test('gateNodeSchema accepts a valid gate node', () => {
+    const result = gateNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh --strict',
+      timeout: 1500,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test('rejects missing gate field in gateNodeSchema', () => {
+    const result = gateNodeSchema.safeParse({ id: 'gate-check' });
+    expect(result.success).toBe(false);
+  });
+
+  test('parses a gate node and auto-derives gate_class', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './harness/scripts/gates/assert-closes-keyword.sh --flag',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(isGateNode(result.data)).toBe(true);
+      const node = result.data as GateNode;
+      expect(node.gate).toBe('./harness/scripts/gates/assert-closes-keyword.sh --flag');
+      expect(node.gate_class).toBe('assert-closes-keyword');
+    }
+  });
+
+  test('preserves an explicit gate_class override', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      gate_class: 'manual-class',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as GateNode;
+      expect(node.gate_class).toBe('manual-class');
+    }
+  });
+
+  test('accepts optional gate_class on gateNodeSchema', () => {
+    const result = gateNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      gate_class: 'manual-class',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test('rejects invalid timeout on gate node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      timeout: 0,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].path).toEqual(['timeout']);
+    }
+  });
+
+  test('rejects gate + command (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      command: 'build',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects gate + prompt (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      prompt: 'Do work',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects gate + bash (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      bash: 'echo hi',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects gate + loop (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      loop: {
+        prompt: 'keep going',
+        until: 'COMPLETE',
+        max_iterations: 2,
+      },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects gate + approval (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      approval: { message: 'Need review' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects gate + cancel (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      cancel: 'stop',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects gate + script (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      script: 'console.log("hi")',
+      runtime: 'bun',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects gate with non-derivable gate_class from path token', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: '/',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('gate_class');
+      expect(result.error.issues[0].path).toEqual(['gate']);
+    }
+  });
+
+  test('strips AI-only fields from gate nodes', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate-check',
+      gate: './scripts/check.sh',
+      effort: 'high',
+      thinking: 'adaptive',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect('effort' in result.data).toBe(false);
+      expect('thinking' in result.data).toBe(false);
     }
   });
 });
@@ -660,6 +908,34 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
     for (const field of expectedFields) {
       expect(SCRIPT_NODE_AI_FIELDS).toContain(field);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GATE_NODE_AI_FIELDS constant
+// ---------------------------------------------------------------------------
+
+describe('GATE_NODE_AI_FIELDS', () => {
+  test('matches bash node AI fields', () => {
+    expect(GATE_NODE_AI_FIELDS).toEqual([
+      'provider',
+      'model',
+      'context',
+      'output_format',
+      'allowed_tools',
+      'denied_tools',
+      'hooks',
+      'mcp',
+      'skills',
+      'agents',
+      'effort',
+      'thinking',
+      'maxBudgetUsd',
+      'systemPrompt',
+      'fallbackModel',
+      'betas',
+      'sandbox',
+    ]);
   });
 });
 

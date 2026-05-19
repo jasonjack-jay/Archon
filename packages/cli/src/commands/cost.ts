@@ -27,6 +27,7 @@ interface WorkflowLogEvent {
   workflow_name?: string;
   step?: string;
   node_type?: string;
+  gate_class?: string;
   duration_ms?: number;
   cost_usd?: number;
   tokens?: TokenUsageLike;
@@ -50,6 +51,12 @@ interface CostSummary {
   total_tokens_out: number;
   total_tokens_cached: number;
   node_count: number;
+  gates: {
+    class: string;
+    count: number;
+    failures: number;
+    total_wall_ms: number;
+  }[];
   top_nodes_by_wall: {
     node_id?: string;
     node_type?: string;
@@ -65,6 +72,8 @@ interface RunAggregate {
   totalWallMs: number;
   totalTokensIn: number;
   totalTokensOut: number;
+  gateClassesSeen: Set<string>;
+  gateClassesFailed: Set<string>;
 }
 
 interface RollupGroup {
@@ -75,6 +84,7 @@ interface RollupGroup {
   p95_wall_ms: number;
   total_tokens_in: number;
   total_tokens_out: number;
+  gates_by_class: Record<string, { runs_fired: number; runs_failed: number }>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -109,6 +119,7 @@ function parseEvent(line: string): WorkflowLogEvent | null {
       workflow_name: toStringValue(parsed.workflow_name),
       step: toStringValue(parsed.step),
       node_type: toStringValue(parsed.node_type),
+      gate_class: toStringValue(parsed.gate_class),
       duration_ms: toNumber(parsed.duration_ms),
       cost_usd: toNumber(parsed.cost_usd),
       tokens,
@@ -148,8 +159,14 @@ function buildZeroSummary(): CostSummary {
     total_tokens_out: 0,
     total_tokens_cached: 0,
     node_count: 0,
+    gates: [],
     top_nodes_by_wall: [],
   };
+}
+
+function getGateClass(event: WorkflowLogEvent): string | null {
+  const gateClass = event.gate_class?.trim();
+  return gateClass ? gateClass : null;
 }
 
 function printSummary(summary: CostSummary, json: boolean | undefined): void {
@@ -315,25 +332,57 @@ export async function costSummaryCommand(runId: string, opts: CostCommandOptions
   try {
     const events = await readEvents(join(logDir, `${runId}.jsonl`));
     const summary = buildZeroSummary();
+    const gates = new Map<
+      string,
+      { class: string; count: number; failures: number; total_wall_ms: number }
+    >();
 
     for (const event of events ?? []) {
-      if (event.type !== 'node_complete') continue;
-      const durationMs = event.duration_ms ?? 0;
-      const costUsd = event.cost_usd ?? 0;
-      summary.total_wall_ms += durationMs;
-      summary.total_cost_usd += costUsd;
-      summary.total_tokens_in += event.tokens?.input ?? 0;
-      summary.total_tokens_out += event.tokens?.output ?? 0;
-      summary.total_tokens_cached += event.tokens?.cached ?? 0;
-      summary.node_count += 1;
-      summary.top_nodes_by_wall.push({
-        node_id: event.step,
-        node_type: event.node_type,
-        wall_ms: durationMs,
-        cost_usd: costUsd,
-      });
+      const gateClass = getGateClass(event);
+      if (event.type === 'node_complete') {
+        const durationMs = event.duration_ms ?? 0;
+        const costUsd = event.cost_usd ?? 0;
+        summary.total_wall_ms += durationMs;
+        summary.total_cost_usd += costUsd;
+        summary.total_tokens_in += event.tokens?.input ?? 0;
+        summary.total_tokens_out += event.tokens?.output ?? 0;
+        summary.total_tokens_cached += event.tokens?.cached ?? 0;
+        summary.node_count += 1;
+        summary.top_nodes_by_wall.push({
+          node_id: event.step,
+          node_type: event.node_type,
+          wall_ms: durationMs,
+          cost_usd: costUsd,
+        });
+
+        if (event.node_type === 'gate' && gateClass) {
+          const gateSummary = gates.get(gateClass) ?? {
+            class: gateClass,
+            count: 0,
+            failures: 0,
+            total_wall_ms: 0,
+          };
+          gateSummary.count += 1;
+          gateSummary.total_wall_ms += durationMs;
+          gates.set(gateClass, gateSummary);
+        }
+      }
+
+      if (event.type === 'node_error' && gateClass) {
+        const gateSummary = gates.get(gateClass) ?? {
+          class: gateClass,
+          count: 0,
+          failures: 0,
+          total_wall_ms: 0,
+        };
+        gateSummary.failures += 1;
+        gates.set(gateClass, gateSummary);
+      }
     }
 
+    summary.gates = [...gates.values()].sort(
+      (a, b) => b.count - a.count || a.class.localeCompare(b.class)
+    );
     summary.top_nodes_by_wall.sort((a, b) => b.wall_ms - a.wall_ms);
     summary.top_nodes_by_wall = summary.top_nodes_by_wall.slice(0, 5);
     printSummary(summary, opts.json);
@@ -458,8 +507,18 @@ export async function costRollCommand(opts: CostRollOptions): Promise<number> {
       let totalWallMs = 0;
       let totalTokensIn = 0;
       let totalTokensOut = 0;
+      const gateClassesSeen = new Set<string>();
+      const gateClassesFailed = new Set<string>();
 
       for (const event of events) {
+        const gateClass = getGateClass(event);
+        if (gateClass) {
+          gateClassesSeen.add(gateClass);
+          if (event.type === 'node_error') {
+            gateClassesFailed.add(gateClass);
+          }
+        }
+
         if (event.type !== 'node_complete') continue;
         totalCostUsd += event.cost_usd ?? 0;
         totalWallMs += event.duration_ms ?? 0;
@@ -474,6 +533,8 @@ export async function costRollCommand(opts: CostRollOptions): Promise<number> {
         totalWallMs,
         totalTokensIn,
         totalTokensOut,
+        gateClassesSeen,
+        gateClassesFailed,
       });
     }
 
@@ -497,6 +558,21 @@ export async function costRollCommand(opts: CostRollOptions): Promise<number> {
         const totalCostUsd = workflowRuns.reduce((sum, run) => sum + run.totalCostUsd, 0);
         const totalTokensIn = workflowRuns.reduce((sum, run) => sum + run.totalTokensIn, 0);
         const totalTokensOut = workflowRuns.reduce((sum, run) => sum + run.totalTokensOut, 0);
+        const gatesByClass: Record<string, { runs_fired: number; runs_failed: number }> = {};
+
+        for (const run of workflowRuns) {
+          for (const gateClass of run.gateClassesSeen) {
+            const aggregate = gatesByClass[gateClass] ?? { runs_fired: 0, runs_failed: 0 };
+            aggregate.runs_fired += 1;
+            gatesByClass[gateClass] = aggregate;
+          }
+
+          for (const gateClass of run.gateClassesFailed) {
+            const aggregate = gatesByClass[gateClass] ?? { runs_fired: 0, runs_failed: 0 };
+            aggregate.runs_failed += 1;
+            gatesByClass[gateClass] = aggregate;
+          }
+        }
 
         return {
           workflow_name: workflowName,
@@ -506,6 +582,7 @@ export async function costRollCommand(opts: CostRollOptions): Promise<number> {
           p95_wall_ms: computeNearestRank(wallTimes, 95),
           total_tokens_in: totalTokensIn,
           total_tokens_out: totalTokensOut,
+          gates_by_class: gatesByClass,
         };
       })
       .sort((a, b) => a.workflow_name.localeCompare(b.workflow_name));

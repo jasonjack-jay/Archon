@@ -31,6 +31,7 @@ import type {
   ApprovalNode,
   BashNode,
   CommandNode,
+  GateNode,
   PromptNode,
   LoopNode,
   ScriptNode,
@@ -43,6 +44,7 @@ import type {
 } from './schemas';
 import {
   isBashNode,
+  isGateNode,
   isLoopNode,
   isApprovalNode,
   isCancelNode,
@@ -1464,6 +1466,209 @@ async function executeBashNode(
       nodeName: node.id,
       error: errorMsg,
     });
+
+    return { state: 'failed', output: '', error: errorMsg };
+  }
+}
+
+async function executeGateNode(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflowRun: WorkflowRun,
+  node: GateNode,
+  artifactsDir: string,
+  logDir: string,
+  baseBranch: string,
+  docsDir: string,
+  nodeOutputs: Map<string, NodeOutput>,
+  issueContext?: string,
+  envVars?: Record<string, string>
+): Promise<NodeOutput> {
+  const nodeStartTime = Date.now();
+  const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
+
+  getLog().info({ nodeId: node.id, type: 'gate', gateClass: node.gate_class }, 'dag_node_started');
+  await logNodeStart(logDir, workflowRun.id, node.id, '<gate>');
+
+  deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'node_started',
+      step_name: node.id,
+      data: { type: 'gate', gate_class: node.gate_class },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, eventType: 'node_started' },
+        'workflow_event_persist_failed'
+      );
+    });
+
+  const emitter = getWorkflowEventEmitter();
+  emitter.emit({
+    type: 'node_started',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+  });
+
+  const { prompt: substitutedScript } = substituteWorkflowVariables(
+    node.gate,
+    workflowRun.id,
+    workflowRun.user_message,
+    artifactsDir,
+    baseBranch,
+    docsDir,
+    issueContext,
+    undefined,
+    undefined,
+    undefined,
+    { shellSafe: true }
+  );
+  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true);
+
+  const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
+  const subprocessEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ARTIFACTS_DIR: artifactsDir,
+    LOG_DIR: logDir,
+    BASE_BRANCH: baseBranch,
+    USER_MESSAGE: workflowRun.user_message,
+    ARGUMENTS: workflowRun.user_message,
+    LOOP_USER_INPUT: '',
+    LOOP_PREV_OUTPUT: '',
+    REJECTION_REASON: '',
+    CONTEXT: issueContext ?? '',
+    EXTERNAL_CONTEXT: issueContext ?? '',
+    ISSUE_CONTEXT: issueContext ?? '',
+    ...(envVars ?? {}),
+  };
+
+  try {
+    const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
+      cwd,
+      timeout,
+      env: subprocessEnv,
+    });
+
+    const output = stdout.replace(/\n$/, '');
+
+    if (stderr.trim()) {
+      getLog().warn(
+        { nodeId: node.id, gateClass: node.gate_class, stderr: stderr.trim() },
+        'gate_node_stderr'
+      );
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `Gate node '${node.id}' stderr:\n\`\`\`\n${stderr.trim()}\n\`\`\``,
+        nodeContext
+      );
+    }
+
+    const duration = Date.now() - nodeStartTime;
+    getLog().info(
+      { nodeId: node.id, durationMs: duration, nodeType: 'gate', gateClass: node.gate_class },
+      'dag_node_completed'
+    );
+    await logNodeComplete(logDir, workflowRun.id, node.id, '<gate>', {
+      durationMs: duration,
+      nodeType: 'gate',
+      gateClass: node.gate_class,
+    });
+
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'node_completed',
+        step_name: node.id,
+        data: {
+          duration_ms: duration,
+          type: 'gate',
+          gate_class: node.gate_class,
+          node_output: output,
+        },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, eventType: 'node_completed' },
+          'workflow_event_persist_failed'
+        );
+      });
+
+    emitter.emit({
+      type: 'node_completed',
+      runId: workflowRun.id,
+      nodeId: node.id,
+      nodeName: node.id,
+      duration,
+      nodeType: 'gate',
+      gateClass: node.gate_class,
+    } as Parameters<typeof emitter.emit>[0]);
+
+    return { state: 'completed', output };
+  } catch (error) {
+    const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
+    const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+
+    let errorMsg: string;
+    if (isTimeout) {
+      errorMsg = `GATE_FAILED: ${node.gate_class}: timed out after ${String(timeout)}ms`;
+    } else if (err.code === 'ENOENT' || err.message?.includes('ENOENT')) {
+      errorMsg = `GATE_FAILED: ${node.gate_class}: bash executable not found in PATH`;
+    } else if (err.code === 'EACCES' || err.message?.includes('EACCES')) {
+      errorMsg = `GATE_FAILED: ${node.gate_class}: permission denied (check cwd permissions)`;
+    } else {
+      const stderrTail =
+        err.stderr?.trim() ||
+        err.message
+          .split('\n')[0]
+          ?.replace(/^Command failed:\s*bash\s+-c\s+/, '')
+          .trim() ||
+        'unknown error';
+      const truncatedTail =
+        stderrTail.length > 1024 ? `${stderrTail.slice(0, 1021)}...` : stderrTail;
+      errorMsg = `GATE_FAILED: ${node.gate_class}: ${truncatedTail}`;
+    }
+
+    getLog().error(
+      {
+        nodeId: node.id,
+        nodeType: 'gate',
+        gateClass: node.gate_class,
+        isTimeout,
+        error: errorMsg,
+      },
+      'dag_node_failed'
+    );
+    await logNodeError(logDir, workflowRun.id, node.id, errorMsg, {
+      gateClass: node.gate_class,
+    });
+
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'node_failed',
+        step_name: node.id,
+        data: { error: errorMsg, type: 'gate', gate_class: node.gate_class },
+      })
+      .catch((dbErr: Error) => {
+        getLog().error(
+          { err: dbErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+          'workflow_event_persist_failed'
+        );
+      });
+
+    emitter.emit({
+      type: 'node_failed',
+      runId: workflowRun.id,
+      nodeId: node.id,
+      nodeName: node.id,
+      error: errorMsg,
+      gateClass: node.gate_class,
+    } as Parameters<typeof emitter.emit>[0]);
 
     return { state: 'failed', output: '', error: errorMsg };
   }
@@ -2921,6 +3126,25 @@ export async function executeDagWorkflow(
           // 3e. Script node dispatch — runs via bun or uv
           if (isScriptNode(node)) {
             const output = await executeScriptNode(
+              deps,
+              platform,
+              conversationId,
+              cwd,
+              workflowRun,
+              node,
+              artifactsDir,
+              logDir,
+              baseBranch,
+              docsDir,
+              nodeOutputs,
+              issueContext,
+              config.envVars
+            );
+            return { nodeId: node.id, output };
+          }
+
+          if (isGateNode(node)) {
+            const output = await executeGateNode(
               deps,
               platform,
               conversationId,

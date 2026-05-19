@@ -31,6 +31,7 @@ import {
   logWorkflowError,
   logWorkflowComplete,
   logNodeComplete,
+  logNodeError,
   type WorkflowEvent,
 } from './logger';
 
@@ -234,6 +235,38 @@ Line 3`;
         cost: 0.0012,
       });
       expect(events[0].cost_usd).toBe(0.0012);
+    });
+
+    it('should persist gate_class in snake_case metadata', async () => {
+      await logNodeComplete(testDir, 'node-gate-complete-test', 'policy-gate', '<gate>', {
+        durationMs: 55,
+        nodeType: 'gate',
+        gateClass: 'assert-closes-keyword',
+      });
+
+      const events = await readLogFile('node-gate-complete-test');
+      expect(events).toHaveLength(1);
+      expect(events[0].type).toBe('node_complete');
+      expect(events[0].node_type).toBe('gate');
+      expect(events[0].gate_class).toBe('assert-closes-keyword');
+    });
+  });
+
+  describe('logNodeError', () => {
+    it('should persist gate_class in snake_case metadata', async () => {
+      await logNodeError(
+        testDir,
+        'node-gate-error-test',
+        'policy-gate',
+        'GATE_FAILED: assert-closes-keyword: missing keyword',
+        { gateClass: 'assert-closes-keyword' }
+      );
+
+      const events = await readLogFile('node-gate-error-test');
+      expect(events).toHaveLength(1);
+      expect(events[0].type).toBe('node_error');
+      expect(events[0].error).toContain('GATE_FAILED');
+      expect(events[0].gate_class).toBe('assert-closes-keyword');
     });
   });
 

@@ -45,7 +45,7 @@ import {
 } from './dag-executor';
 import * as workflowLogger from './logger';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
-import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
+import type { DagNode, BashNode, GateNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
@@ -6416,6 +6416,309 @@ describe('executeDagWorkflow -- cost tracking', () => {
     ).mock.calls;
     expect(completeCalls.length).toBe(1);
     expect(completeCalls[0][1]).toMatchObject({ total_cost_usd: 0.004 });
+  });
+});
+
+describe('executeDagWorkflow -- gate nodes', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-gate-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+
+    resetWorkflowEventEmitter();
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('gate node success emits gateClass and nodeType on logs, store events, and emitter events', async () => {
+    const logNodeCompleteSpy = spyOn(workflowLogger, 'logNodeComplete').mockResolvedValue(
+      undefined
+    );
+    const emitter = getWorkflowEventEmitter();
+    const emitSpy = spyOn(emitter, 'emit');
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-success-run-id', {
+      workflow_name: 'gate-success-test',
+      conversation_id: 'conv-gate',
+      user_message: 'gate test message',
+    });
+
+    const gateNode: GateNode = {
+      id: 'policy-gate',
+      gate: 'echo "gate ok"',
+      gate_class: 'assert-closes-keyword',
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-gate',
+      testDir,
+      { name: 'gate-success-test', nodes: [gateNode] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+    expect(logNodeCompleteSpy).toHaveBeenCalledWith(
+      join(testDir, 'logs'),
+      workflowRun.id,
+      'policy-gate',
+      '<gate>',
+      {
+        durationMs: expect.any(Number),
+        nodeType: 'gate',
+        gateClass: 'assert-closes-keyword',
+      }
+    );
+
+    const completedEventCall = (
+      store.createWorkflowEvent as ReturnType<typeof mock>
+    ).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'policy-gate'
+    );
+    expect(completedEventCall).toBeDefined();
+    expect((completedEventCall![0] as { data: Record<string, unknown> }).data).toMatchObject({
+      type: 'gate',
+      gate_class: 'assert-closes-keyword',
+      node_output: 'gate ok',
+    });
+
+    const nodeCompletedEmit = emitSpy.mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { type?: string }).type === 'node_completed' &&
+        (call[0] as { nodeId?: string }).nodeId === 'policy-gate'
+    )?.[0] as Record<string, unknown> | undefined;
+    expect(nodeCompletedEmit).toMatchObject({
+      type: 'node_completed',
+      runId: workflowRun.id,
+      nodeId: 'policy-gate',
+      nodeName: 'policy-gate',
+      nodeType: 'gate',
+      gateClass: 'assert-closes-keyword',
+    });
+    expect(nodeCompletedEmit?.duration).toEqual(expect.any(Number));
+
+    emitSpy.mockRestore();
+    logNodeCompleteSpy.mockRestore();
+  });
+
+  it('non-zero gate exit uses the GATE_FAILED prefix and preserves gateClass metadata', async () => {
+    const logNodeErrorSpy = spyOn(workflowLogger, 'logNodeError').mockResolvedValue(undefined);
+    const emitter = getWorkflowEventEmitter();
+    const emitSpy = spyOn(emitter, 'emit');
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-fail-run-id', {
+      workflow_name: 'gate-fail-test',
+      conversation_id: 'conv-gate-fail',
+      user_message: 'gate fail message',
+    });
+
+    const gateNode: GateNode = {
+      id: 'policy-gate',
+      gate: 'echo "missing keyword" >&2; exit 1',
+      gate_class: 'assert-closes-keyword',
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-gate-fail',
+      testDir,
+      { name: 'gate-fail-test', nodes: [gateNode] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const failedEventCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'policy-gate'
+    );
+    expect(failedEventCall).toBeDefined();
+    const errorMsg = (failedEventCall![0] as { data: { error: string } }).data.error;
+    expect(errorMsg).toStartWith('GATE_FAILED: assert-closes-keyword: ');
+    expect(errorMsg).toContain('missing keyword');
+
+    expect(logNodeErrorSpy).toHaveBeenCalledWith(
+      join(testDir, 'logs'),
+      workflowRun.id,
+      'policy-gate',
+      expect.stringContaining('GATE_FAILED: assert-closes-keyword:'),
+      { gateClass: 'assert-closes-keyword' }
+    );
+
+    const nodeFailedEmit = emitSpy.mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { type?: string }).type === 'node_failed' &&
+        (call[0] as { nodeId?: string }).nodeId === 'policy-gate'
+    )?.[0] as Record<string, unknown> | undefined;
+    expect(nodeFailedEmit).toMatchObject({
+      type: 'node_failed',
+      runId: workflowRun.id,
+      nodeId: 'policy-gate',
+      nodeName: 'policy-gate',
+      gateClass: 'assert-closes-keyword',
+      error: expect.stringContaining('GATE_FAILED: assert-closes-keyword:'),
+    });
+
+    emitSpy.mockRestore();
+    logNodeErrorSpy.mockRestore();
+  });
+
+  it('gate timeout produces a GATE_FAILED timed out error', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-timeout-run-id', {
+      workflow_name: 'gate-timeout-test',
+      conversation_id: 'conv-gate-timeout',
+      user_message: 'gate timeout message',
+    });
+
+    const gateNode: GateNode = {
+      id: 'policy-gate',
+      gate: 'sleep 5',
+      gate_class: 'assert-closes-keyword',
+      timeout: 100,
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-gate-timeout',
+      testDir,
+      { name: 'gate-timeout-test', nodes: [gateNode] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const failedEventCall = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'policy-gate'
+    );
+    expect(failedEventCall).toBeDefined();
+    expect((failedEventCall![0] as { data: { error: string } }).data.error).toBe(
+      'GATE_FAILED: assert-closes-keyword: timed out after 100ms'
+    );
+  });
+
+  it('gate_class defaults from the gate script path', async () => {
+    const scriptsDir = join(testDir, 'scripts');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(join(scriptsDir, 'g.sh'), '#!/bin/bash\necho ok\nexit 0\n', { mode: 0o755 });
+
+    const parseResult = parseWorkflow(
+      `
+name: gate-defaulting
+description: gate defaulting test
+nodes:
+  - id: policy-gate
+    gate: "./scripts/g.sh --x"
+`,
+      'gate-defaulting.yaml'
+    );
+    expect(parseResult.error).toBeNull();
+    expect(parseResult.workflow).not.toBeNull();
+
+    const emitter = getWorkflowEventEmitter();
+    const emitSpy = spyOn(emitter, 'emit');
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('gate-defaulting-run-id', {
+      workflow_name: 'gate-defaulting-test',
+      conversation_id: 'conv-gate-defaulting',
+      user_message: 'gate defaulting message',
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-gate-defaulting',
+      testDir,
+      parseResult.workflow!,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const completedEventCall = (
+      store.createWorkflowEvent as ReturnType<typeof mock>
+    ).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'policy-gate'
+    );
+    expect(completedEventCall).toBeDefined();
+    expect((completedEventCall![0] as { data: Record<string, unknown> }).data).toMatchObject({
+      type: 'gate',
+      gate_class: 'g',
+    });
+
+    const nodeCompletedEmit = emitSpy.mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { type?: string }).type === 'node_completed' &&
+        (call[0] as { nodeId?: string }).nodeId === 'policy-gate'
+    )?.[0] as Record<string, unknown> | undefined;
+    expect(nodeCompletedEmit).toMatchObject({
+      type: 'node_completed',
+      nodeType: 'gate',
+      gateClass: 'g',
+    });
+
+    emitSpy.mockRestore();
   });
 });
 

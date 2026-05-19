@@ -285,6 +285,7 @@ describe('WorkflowEventEmitter', () => {
           nodeName: 'classify-issue',
           duration: 150,
           nodeType: 'prompt',
+          gateClass: 'assert-closes-keyword',
           tokens: { input: 10, output: 5, total: 15, cost: 0.001 },
         },
         {
@@ -292,6 +293,7 @@ describe('WorkflowEventEmitter', () => {
           runId: 'run-1',
           nodeId: 'classify',
           nodeName: 'classify-issue',
+          gateClass: 'assert-closes-keyword',
           error: 'fail',
         },
         makeNodeSkippedEvent(),
@@ -303,6 +305,35 @@ describe('WorkflowEventEmitter', () => {
       }
 
       expect(received).toHaveLength(events.length);
+    });
+
+    it('preserves gateClass on node lifecycle events', () => {
+      const emitter = getWorkflowEventEmitter();
+      const captured: WorkflowEmitterEvent[] = [];
+      emitter.subscribe(event => captured.push(event));
+
+      const completedEvent: WorkflowEmitterEvent = {
+        type: 'node_completed',
+        runId: 'run-gate',
+        nodeId: 'gate-node',
+        nodeName: 'gate-node',
+        duration: 25,
+        nodeType: 'gate',
+        gateClass: 'assert-closes-keyword',
+      };
+      const failedEvent: WorkflowEmitterEvent = {
+        type: 'node_failed',
+        runId: 'run-gate',
+        nodeId: 'gate-node',
+        nodeName: 'gate-node',
+        gateClass: 'assert-closes-keyword',
+        error: 'GATE_FAILED: assert-closes-keyword: missing keyword',
+      };
+
+      expect(() => emitter.emit(completedEvent)).not.toThrow();
+      expect(() => emitter.emit(failedEvent)).not.toThrow();
+
+      expect(captured).toEqual([completedEvent, failedEvent]);
     });
   });
 

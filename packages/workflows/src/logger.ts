@@ -32,6 +32,7 @@ export interface WorkflowEvent {
   workflow_name?: string;
   step?: string;
   node_type?: string;
+  gate_class?: string;
   content?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
@@ -204,6 +205,7 @@ export async function logNodeComplete(
     tokens?: WorkflowTokenUsage;
     costUsd?: number;
     nodeType?: string;
+    gateClass?: string;
   }
 ): Promise<void> {
   await logWorkflowEvent(logDir, workflowRunId, {
@@ -211,6 +213,7 @@ export async function logNodeComplete(
     step: nodeId,
     content: commandName,
     ...(meta?.nodeType ? { node_type: meta.nodeType } : {}),
+    ...(meta?.gateClass ? { gate_class: meta.gateClass } : {}),
     ...(meta?.durationMs !== undefined ? { duration_ms: meta.durationMs } : {}),
     ...(meta?.tokens ? { tokens: meta.tokens } : {}),
     ...(meta?.costUsd !== undefined ? { cost_usd: meta.costUsd } : {}),
@@ -236,11 +239,15 @@ export async function logNodeError(
   logDir: string,
   workflowRunId: string,
   nodeId: string,
-  error: string
+  error: string,
+  meta?: {
+    gateClass?: string;
+  }
 ): Promise<void> {
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'node_error',
     step: nodeId,
     error,
+    ...(meta?.gateClass ? { gate_class: meta.gateClass } : {}),
   });
 }
