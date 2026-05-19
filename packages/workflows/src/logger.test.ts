@@ -30,6 +30,7 @@ import {
   logValidation,
   logWorkflowError,
   logWorkflowComplete,
+  logNodeComplete,
   type WorkflowEvent,
 } from './logger';
 
@@ -206,6 +207,33 @@ Line 3`;
       const events = await readLogFile('complete-test');
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe('workflow_complete');
+    });
+  });
+
+  describe('logNodeComplete', () => {
+    it('should log node duration, tokens, and cost', async () => {
+      await logNodeComplete(testDir, 'node-cost-test', 'implement', 'prompt', {
+        durationMs: 1234,
+        tokens: {
+          input: 100,
+          output: 25,
+          total: 125,
+          cost: 0.0012,
+        },
+        costUsd: 0.0012,
+      });
+
+      const events = await readLogFile('node-cost-test');
+      expect(events).toHaveLength(1);
+      expect(events[0].type).toBe('node_complete');
+      expect(events[0].duration_ms).toBe(1234);
+      expect(events[0].tokens).toEqual({
+        input: 100,
+        output: 25,
+        total: 125,
+        cost: 0.0012,
+      });
+      expect(events[0].cost_usd).toBe(0.0012);
     });
   });
 

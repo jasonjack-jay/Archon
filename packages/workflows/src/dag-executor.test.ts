@@ -43,12 +43,14 @@ import {
   substituteNodeOutputRefs,
   executeDagWorkflow,
 } from './dag-executor';
+import * as workflowLogger from './logger';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
+import { getWorkflowEventEmitter, resetWorkflowEventEmitter } from './event-emitter';
 
 // --- Mock helpers ---
 
@@ -6274,6 +6276,94 @@ describe('executeDagWorkflow -- cost tracking', () => {
     ).mock.calls;
     expect(completeCalls.length).toBe(1);
     expect(completeCalls[0][1]).not.toHaveProperty('total_cost_usd');
+  });
+
+  it('passes nodeType, tokens, and costUsd through node completion logging and events', async () => {
+    resetWorkflowEventEmitter();
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'Structured response' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-node-metadata',
+        tokens: {
+          input: 120,
+          output: 30,
+          total: 150,
+          cost: 0.0042,
+        },
+        cost: 0.0042,
+      };
+    });
+
+    const logNodeCompleteSpy = spyOn(workflowLogger, 'logNodeComplete').mockResolvedValue(
+      undefined
+    );
+    const emitter = getWorkflowEventEmitter();
+    const emitSpy = spyOn(emitter, 'emit');
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      { name: 'dag-node-metadata', nodes: [{ id: 'step', prompt: 'Do thing.' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(logNodeCompleteSpy).toHaveBeenCalledWith(
+      join(testDir, 'logs'),
+      workflowRun.id,
+      'step',
+      '<inline>',
+      {
+        durationMs: expect.any(Number),
+        tokens: {
+          input: 120,
+          output: 30,
+          total: 150,
+          cost: 0.0042,
+        },
+        costUsd: 0.0042,
+        nodeType: 'prompt',
+      }
+    );
+
+    const nodeCompletedEmit = emitSpy.mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { type?: string }).type === 'node_completed' &&
+        (call[0] as { nodeId?: string }).nodeId === 'step'
+    )?.[0] as Record<string, unknown> | undefined;
+
+    expect(nodeCompletedEmit).toMatchObject({
+      type: 'node_completed',
+      runId: workflowRun.id,
+      nodeId: 'step',
+      nodeName: 'step',
+      nodeType: 'prompt',
+      costUsd: 0.0042,
+      tokens: {
+        input: 120,
+        output: 30,
+        total: 150,
+        cost: 0.0042,
+      },
+    });
+    expect(nodeCompletedEmit?.duration).toEqual(expect.any(Number));
+
+    emitSpy.mockRestore();
+    logNodeCompleteSpy.mockRestore();
   });
 
   it('accumulates cost across loop iterations and includes in completeWorkflowRun', async () => {

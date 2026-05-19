@@ -284,6 +284,8 @@ describe('WorkflowEventEmitter', () => {
           nodeId: 'classify',
           nodeName: 'classify-issue',
           duration: 150,
+          nodeType: 'prompt',
+          tokens: { input: 10, output: 5, total: 15, cost: 0.001 },
         },
         {
           type: 'node_failed',
@@ -565,6 +567,8 @@ describe('WorkflowEventEmitter', () => {
         nodeId: 'plan',
         nodeName: 'plan',
         duration: 400,
+        nodeType: 'command',
+        tokens: { input: 20, output: 8, total: 28, cost: 0.002 },
       });
       emitter.emit({ type: 'node_started', runId, nodeId: 'implement', nodeName: 'implement' });
       emitter.emit({
@@ -580,6 +584,8 @@ describe('WorkflowEventEmitter', () => {
         nodeId: 'implement',
         nodeName: 'implement',
         duration: 900,
+        nodeType: 'prompt',
+        tokens: { input: 30, output: 12, total: 42, cost: 0.003 },
       });
       emitter.emit({
         type: 'workflow_completed',

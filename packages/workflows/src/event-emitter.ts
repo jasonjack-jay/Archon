@@ -10,6 +10,7 @@
  * - Conversation-scoped subscriptions via registerRun() mapping
  */
 import { EventEmitter } from 'events';
+import type { WorkflowTokenUsage } from './deps';
 import type { ArtifactType } from './schemas';
 import { createLogger } from '@archon/paths';
 
@@ -92,6 +93,8 @@ interface NodeCompletedEvent {
   nodeId: string;
   nodeName: string;
   duration: number;
+  nodeType?: string;
+  tokens?: WorkflowTokenUsage;
   costUsd?: number;
   stopReason?: string;
   numTurns?: number;

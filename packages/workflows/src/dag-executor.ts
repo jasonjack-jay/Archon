@@ -1185,8 +1185,10 @@ async function executeNodeInternal(
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, node.command ?? '<inline>', {
+      nodeType: node.command ? 'command' : 'prompt',
       durationMs: duration,
       tokens: nodeTokens,
+      costUsd: nodeCostUsd,
     });
 
     deps.store
@@ -1216,6 +1218,8 @@ async function executeNodeInternal(
       nodeId: node.id,
       nodeName: node.command ?? node.id,
       duration,
+      nodeType: node.command ? 'command' : 'prompt',
+      tokens: nodeTokens,
       ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
       ...(nodeNumTurns !== undefined ? { numTurns: nodeNumTurns } : {}),
@@ -1385,7 +1389,10 @@ async function executeBashNode(
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
-    await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
+    await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', {
+      durationMs: duration,
+      nodeType: 'bash',
+    });
 
     deps.store
       .createWorkflowEvent({
@@ -1407,6 +1414,7 @@ async function executeBashNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
+      nodeType: 'bash',
     });
 
     return { state: 'completed', output };
@@ -1654,7 +1662,10 @@ async function executeScriptNode(
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
-    await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
+    await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', {
+      durationMs: duration,
+      nodeType: 'script',
+    });
 
     deps.store
       .createWorkflowEvent({
@@ -1676,6 +1687,7 @@ async function executeScriptNode(
       nodeId: node.id,
       nodeName: node.id,
       duration,
+      nodeType: 'script',
     });
 
     return { state: 'completed', output };
@@ -2246,6 +2258,7 @@ async function executeLoopNode(
 
     await logNodeComplete(logDir, workflowRun.id, `${node.id}-iteration-${String(i)}`, node.id, {
       durationMs: duration,
+      nodeType: 'loop_iteration',
     });
 
     // Completion signal detected — exit the loop.
@@ -2288,6 +2301,7 @@ async function executeLoopNode(
         nodeId: node.id,
         nodeName: node.id,
         duration: Date.now() - iterationStart,
+        nodeType: 'loop',
         ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
         ...(loopFinalStopReason ? { stopReason: loopFinalStopReason } : {}),
         ...(loopTotalNumTurns !== undefined ? { numTurns: loopTotalNumTurns } : {}),

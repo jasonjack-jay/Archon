@@ -66,6 +66,7 @@ import { chatCommand } from './commands/chat';
 import { setupCommand } from './commands/setup';
 import { skillInstallCommand } from './commands/skill';
 import { validateWorkflowsCommand, validateCommandsCommand } from './commands/validate';
+import { costRollCommand, costSummaryCommand, costTailCommand } from './commands/cost';
 import { serveCommand } from './commands/serve';
 import { doctorCommand } from './commands/doctor';
 import { closeDatabase } from '@archon/core';
@@ -108,6 +109,9 @@ Commands:
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main
+  cost summary <run-id>      Summarize cost and wall time for one workflow run
+  cost tail <run-id>         Stream node completion cost events for one workflow run
+  cost roll                  Roll up workflow cost metrics across runs
   continue <branch> [msg]    Continue work on an existing worktree with prior context
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
   serve                      Start the web UI server (downloads web UI on first run)
@@ -132,6 +136,9 @@ Options:
   --no-context               Skip context injection for 'continue'
   --port <port>              Override server port for 'serve' (default: 3090)
   --download-only            Download web UI without starting the server
+  --logdir <dir>             Override workflow log directory for cost commands
+  --since <iso>              Only include runs starting at or after this ISO timestamp
+  --limit <n>                Limit the number of runs used by cost roll
   --force                    Overwrite existing file (for workflow install)
 
 Examples:
@@ -141,6 +148,8 @@ Examples:
   archon workflow run plan --cwd /path/to/repo "Add dark mode"
   archon workflow run implement --branch feature-auth "Implement auth"
   archon workflow run quick-fix --no-worktree "Fix typo"
+  archon cost summary run-123 --json
+  archon cost roll --since 2026-05-01T00:00:00.000Z --limit 20
   archon continue fix/issue-42 --workflow archon-smart-pr-review "Review the changes"
   archon skill install
   archon skill install /path/to/project
@@ -240,6 +249,9 @@ async function main(): Promise<number> {
         'no-context': { type: 'boolean' },
         port: { type: 'string' },
         'download-only': { type: 'boolean' },
+        logdir: { type: 'string' },
+        since: { type: 'string' },
+        limit: { type: 'string' },
         scope: { type: 'string' },
         force: { type: 'boolean' },
       },
@@ -283,6 +295,7 @@ async function main(): Promise<number> {
     'serve',
     'skill',
     'doctor',
+    'cost',
   ];
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
 
@@ -608,6 +621,64 @@ async function main(): Promise<number> {
             console.error('Available: workflows, commands');
             return 1;
         }
+
+      case 'cost': {
+        const costLogDir = values.logdir as string | undefined;
+        const costJson = jsonFlag;
+        switch (subcommand) {
+          case 'summary': {
+            const runId = positionals[2];
+            if (!runId) {
+              console.error('Usage: archon cost summary <run-id> [--json] [--logdir <dir>]');
+              return 1;
+            }
+            return await costSummaryCommand(runId, {
+              cwd: effectiveCwd,
+              json: costJson,
+              logDir: costLogDir,
+            });
+          }
+
+          case 'tail': {
+            const runId = positionals[2];
+            if (!runId) {
+              console.error('Usage: archon cost tail <run-id> [--logdir <dir>]');
+              return 1;
+            }
+            return await costTailCommand(runId, {
+              cwd: effectiveCwd,
+              json: costJson,
+              logDir: costLogDir,
+            });
+          }
+
+          case 'roll': {
+            const since = values.since as string | undefined;
+            const limitRaw = values.limit as string | undefined;
+            const limit = limitRaw === undefined ? undefined : Number.parseInt(limitRaw, 10);
+            if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+              console.error('Error: --limit must be a positive integer');
+              return 1;
+            }
+            return await costRollCommand({
+              cwd: effectiveCwd,
+              json: costJson,
+              logDir: costLogDir,
+              since,
+              limit,
+            });
+          }
+
+          default:
+            if (subcommand === undefined) {
+              console.error('Missing cost subcommand');
+            } else {
+              console.error(`Unknown cost subcommand: ${subcommand}`);
+            }
+            console.error('Available: summary, tail, roll');
+            return 1;
+        }
+      }
 
       case 'complete': {
         const branches = positionals.slice(1);
